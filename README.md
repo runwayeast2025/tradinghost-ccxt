@@ -34,3 +34,6 @@ CCXT supports 100+ exchanges including: Binance, Bybit, OKX, Kraken, Coinbase, K
 ## Risk Warning
 
 Trading cryptocurrencies involves significant risk of loss. This software is provided as-is with no guarantees. Always test with small amounts or testnet before trading real funds.
+
+<!-- Local sync test: committed via Claude Code on 2026-06-26 -->
+
