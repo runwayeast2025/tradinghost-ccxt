@@ -1,0 +1,211 @@
+---
+description: CCXT engine guidance — exchange setup, API patterns, recipes, and risk management for this strategy
+alwaysApply: true
+---
+
+# CCXT Trading Engine
+
+You are helping a user build a crypto trading bot using CCXT. This file covers CCXT-specific knowledge — exchange setup, API patterns, recipes, and risk management. See `tradinghost.mdc` for platform conventions (deployment, env vars, logging, persistence).
+
+## Engine Overview
+
+CCXT (CryptoCurrency eXchange Trading Library) provides a unified API for 100+ crypto exchanges. One codebase trades on Binance, Bybit, OKX, Kraken, Coinbase, and dozens more. Supports spot, futures (linear and inverse), margin, and options on exchanges that offer them.
+
+Key capabilities:
+- Market data: tickers, order books, OHLCV candles, trades
+- Trading: market/limit/stop orders, position management
+- Account: balances, open orders, trade history, positions (futures)
+- Unified API: same method names across all exchanges
+- Async support: `ccxt.async_support` module for non-blocking I/O
+
+Limitations:
+- No built-in WebSocket (use `ccxt.pro` for real-time streaming, separate install: `ccxtpro`)
+- Rate limits are per-exchange — CCXT handles basic throttling but you must respect exchange-specific rules
+- Not all exchanges support all features — check `exchange.has['feature']` before calling
+
+## Exchange Setup
+
+API credentials are read from **environment variables** (TradingHost strategy secrets), never from `config.json`. Set `EXCHANGE_API_KEY` / `EXCHANGE_API_SECRET` (and `EXCHANGE_API_PASSPHRASE` for OKX) as strategy secrets; non-secret tunables like the exchange name, symbols, and testnet flag live in `config.json`. See `tradinghost.mdc` → "Secrets & Credentials".
+
+### Binance (most popular)
+
+1. Go to https://www.binance.com/en/my/settings/api-management
+2. Click "Create API" → choose "System generated"
+3. Label it (e.g. "TradingHost Bot")
+4. Complete 2FA verification
+5. Enable permissions: "Enable Spot & Margin Trading" (and "Enable Futures" if needed)
+6. Restrict to IP if you know your deployment's IP (optional but recommended)
+7. Copy API Key and Secret Key immediately (secret shown only once)
+8. For testnet: use https://testnet.binance.vision (separate keys from https://testnet.binance.vision/key/generate)
+
+```python
+import ccxt, os
+exchange = ccxt.binance({
+    'apiKey': os.environ['EXCHANGE_API_KEY'],
+    'secret': os.environ['EXCHANGE_API_SECRET'],
+    'options': {'defaultType': 'spot'},  # or 'future' for USDM futures
+})
+if config.get('testnet'):
+    exchange.set_sandbox_mode(True)
+```
+
+### Bybit
+
+1. Go to https://www.bybit.com/app/user/api-management
+2. Create new key → "System-generated API Keys"
+3. Permissions: "Read-Write" for the asset types you need
+4. IP restriction recommended for production
+5. Testnet: https://testnet.bybit.com (separate account + keys)
+
+```python
+exchange = ccxt.bybit({
+    'apiKey': os.environ['EXCHANGE_API_KEY'],
+    'secret': os.environ['EXCHANGE_API_SECRET'],
+})
+if config.get('testnet'):
+    exchange.set_sandbox_mode(True)
+```
+
+### OKX
+
+1. Go to https://www.okx.com/account/my-api
+2. Create API key with Trade permission
+3. Set passphrase (OKX requires a passphrase in addition to key+secret)
+4. Store the passphrase as the `EXCHANGE_API_PASSPHRASE` strategy secret
+
+```python
+exchange = ccxt.okx({
+    'apiKey': os.environ['EXCHANGE_API_KEY'],
+    'secret': os.environ['EXCHANGE_API_SECRET'],
+    'password': os.environ['EXCHANGE_API_PASSPHRASE'],
+})
+```
+
+### General pattern for any exchange
+
+```python
+import os
+exchange_class = getattr(ccxt, config['exchange'])
+exchange = exchange_class({
+    'apiKey': os.environ['EXCHANGE_API_KEY'],
+    'secret': os.environ['EXCHANGE_API_SECRET'],
+    'password': os.environ.get('EXCHANGE_API_PASSPHRASE', ''),
+})
+if config.get('testnet'):
+    exchange.set_sandbox_mode(True)
+exchange.load_markets()
+```
+
+## CCXT-Specific Guidance
+
+### Rate Limiting
+
+CCXT handles basic rate limiting, but teach the user:
+- Call `exchange.load_markets()` once at startup, not every loop
+- Cache ticker data when possible (don't fetch every second if you only trade every minute)
+- Use `exchange.rateLimit` to know the minimum ms between requests
+- Wrap exchange calls in try/except for `ccxt.RateLimitExceeded`
+
+## Recipes
+
+### Adding a New Trading Pair
+
+1. Add the symbol to `config.json` → `symbols` array
+2. The strategy loop iterates over `config['symbols']` — new pairs are picked up on next restart
+3. If using per-symbol state, ensure the SQLite table handles the new pair
+
+### Adding Stop Loss / Take Profit
+
+```python
+entry_price = order['average']
+stop_loss = entry_price * (1 - config['stop_loss_pct'] / 100)
+take_profit = entry_price * (1 + config['take_profit_pct'] / 100)
+
+exchange.create_order(symbol, 'stop_market', 'sell', amount, None, {'stopPrice': stop_loss})
+exchange.create_order(symbol, 'take_profit_market', 'sell', amount, None, {'stopPrice': take_profit})
+```
+
+Not all exchanges support native SL/TP. For spot markets, implement in the strategy loop:
+```python
+if current_price <= entry_price * (1 - stop_loss_pct / 100):
+    exchange.create_market_sell_order(symbol, amount)
+```
+
+### Switching Between Spot and Futures
+
+```python
+# Spot
+exchange.options['defaultType'] = 'spot'
+
+# USD-M Futures
+exchange.options['defaultType'] = 'future'
+
+# Set leverage (futures only)
+exchange.set_leverage(config['leverage'], symbol)
+```
+
+### Fetching Historical Candles for Indicators
+
+```python
+ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=100)
+# Returns: [[timestamp, open, high, low, close, volume], ...]
+
+import pandas as pd
+df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+df['ema_20'] = df['close'].ewm(span=20).mean()
+```
+
+### Adding a TradingView Webhook Endpoint
+
+If the user wants to execute trades from TradingView alerts, add a webhook endpoint to the panel:
+
+```python
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    data = request.get_json(force=True)
+    if data.get('secret') != os.environ.get('WEBHOOK_SECRET'):
+        return jsonify({'error': 'unauthorized'}), 401
+    symbol = data.get('symbol', config['default_symbol'])
+    side = data.get('side', 'buy')
+    amount = float(data.get('amount', config['default_amount']))
+    try:
+        if side == 'buy':
+            order = exchange.create_market_buy_order(symbol, amount)
+        else:
+            order = exchange.create_market_sell_order(symbol, amount)
+        return jsonify({'status': 'filled', 'order_id': order['id']})
+    except Exception as e:
+        return jsonify({'status': 'error', 'error': str(e)}), 500
+```
+
+Remind the user to allocate a port and set a `WEBHOOK_SECRET` strategy secret.
+
+## Risk Management
+
+Always advise the user on risk:
+- Never risk more than 1-2% of account per trade
+- Always use stop losses (exchange-native or software-based)
+- Set a max position size in config — never exceed it regardless of signals
+- Track daily/weekly drawdown — pause trading if exceeded
+- Start on testnet — switch to live only after confirming correct behavior
+- Diversify across multiple symbols rather than concentrating
+- Account for fees in profit calculations (maker/taker fees, funding rates for futures)
+- Set a kill switch: if total loss exceeds X%, cancel all orders and stop
+
+## Testing
+
+### Testnet Workflow
+1. Set `testnet: true` in config
+2. Get testnet API keys from the exchange's testnet portal
+3. Deploy to TradingHost — the bot trades on testnet with fake money
+4. Verify: orders execute, state persists across restarts, shutdown is clean
+5. When satisfied, set `testnet: false` and use real API keys
+
+### What to Verify Before Going Live
+- Bot starts cleanly after a restart (state reconciliation works)
+- SIGTERM produces clean shutdown (no orphaned orders)
+- Rate limits are respected (no 429 errors in steady state)
+- Logging captures all trades with enough detail to audit
+- Stop losses trigger correctly
+- The web panel shows accurate state
+- SQLite state matches exchange state after every operation
